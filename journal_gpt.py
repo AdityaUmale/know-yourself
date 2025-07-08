@@ -9,7 +9,7 @@ import json
 from langchain_openai import OpenAIEmbeddings
 from langchain_qdrant import Qdrant
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
+from qdrant_client.http.models import Distance, VectorParams, Filter, FieldCondition, MatchValue
 
 # ——————————————————————————————————————————————
 # 1. Bootstrap environment and clients (same as before)
@@ -21,8 +21,7 @@ openai.api_key = OPENAI_API_KEY
 client = openai.Client()
 
 embeddings = OpenAIEmbeddings(
-    model="text-embedding-ada-002",
-    openai_api_key=OPENAI_API_KEY
+    model="text-embedding-ada-002"
 )
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -75,7 +74,7 @@ Respond in this JSON format:
             {"role": "user", "content": journal_text}
         ]
     )
-    return response.choices[0].message.content
+    return response.choices[0].message.content or "No response generated."
 
 # ——————————————————————————————————————————————
 # 3. Store journal entry function (unchanged)
@@ -100,12 +99,12 @@ def get_relevant_entries(user_id: str, query: str, limit: int = 10) -> list:
     # First, get all entries for this user
     all_user_entries = qdrant.scroll(
         collection_name=COLLECTION_NAME,
-        scroll_filter={
-            "must": [
-                {"key": "metadata.user_id", "match": {"value": user_id}},
-                {"key": "metadata.type", "match": {"value": "journal"}}
+        scroll_filter=Filter(
+            must=[
+                FieldCondition(key="metadata.user_id", match=MatchValue(value=user_id)),
+                FieldCondition(key="metadata.type", match=MatchValue(value="journal"))
             ]
-        },
+        ),
         limit=100  # Adjust based on how many entries you expect
     )[0]  # scroll returns (points, next_page_offset)
     
@@ -123,10 +122,16 @@ def get_relevant_entries(user_id: str, query: str, limit: int = 10) -> list:
     except Exception as e:
         print(f"Search error: {e}")
         # Fallback: return recent entries
-        recent_entries = sorted(all_user_entries, 
-                              key=lambda x: x.payload.get('metadata', {}).get('timestamp', 0), 
-                              reverse=True)[:limit]
-        return [entry.payload.get('page_content', '') for entry in recent_entries if entry.payload.get('page_content')]
+        recent_entries = sorted(
+            [e for e in all_user_entries if e.payload and isinstance(e.payload, dict)],
+            key=lambda x: x.payload.get('metadata', {}).get('timestamp', 0) if x.payload and isinstance(x.payload, dict) else 0,
+            reverse=True
+        )[:limit]
+        return [
+            entry.payload.get('page_content', '')
+            for entry in recent_entries
+            if entry.payload and entry.payload.get('page_content')
+        ]
 
 # ——————————————————————————————————————————————
 # 5. NEW: Personality Analysis Chatbot
@@ -176,8 +181,11 @@ Answer their question based on what you observe in their writing patterns and ex
             {"role": "user", "content": user_question}
         ]
     )
-    
-    return response.choices[0].message.content
+
+    content = response.choices[0].message.content
+    if content is None:
+        return "Sorry, I couldn't generate a response at this time."
+    return content
 
 # ——————————————————————————————————————————————
 # 6. NEW: Interactive Chat Mode
