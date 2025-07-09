@@ -1,0 +1,9 @@
+Title: Big Five Personality Traits
+
+1. Openness to Experience: Creativity, curiosity, imagination.
+2. Conscientiousness: Organization, responsibility, reliability.
+3. Extraversion: Sociability, assertiveness, enthusiasm.
+4. Agreeableness: Compassion, cooperativeness, kindness.
+5. Neuroticism: Emotional instability, anxiety, moodiness.
+
+These traits help understand one's personality and behavior patterns.

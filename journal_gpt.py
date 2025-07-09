@@ -12,7 +12,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams, Filter, FieldCondition, MatchValue
 
 # ——————————————————————————————————————————————
-# 1. Bootstrap environment and clients (same as before)
+# 1. Bootstrap environment and clients
 # ——————————————————————————————————————————————
 load_dotenv()
 
@@ -20,31 +20,41 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai.api_key = OPENAI_API_KEY
 client = openai.Client()
 
-embeddings = OpenAIEmbeddings(
-    model="text-embedding-ada-002"
-)
-
+embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-COLLECTION_NAME = "journals"
 EMBEDDING_DIM = 1536
 
 qdrant = QdrantClient(url=QDRANT_URL)
 collections = qdrant.get_collections().collections
 
+# Journal collection
+COLLECTION_NAME = "journals"
 if COLLECTION_NAME not in [c.name for c in collections]:
     qdrant.create_collection(
         collection_name=COLLECTION_NAME,
         vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE)
     )
-
 vectorstore = Qdrant(
     client=qdrant,
     collection_name=COLLECTION_NAME,
     embeddings=embeddings
 )
 
+# 🔥 NEW: Knowledge base collection
+KNOWLEDGE_COLLECTION = "knowledge_base"
+if KNOWLEDGE_COLLECTION not in [c.name for c in collections]:
+    qdrant.create_collection(
+        collection_name=KNOWLEDGE_COLLECTION,
+        vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE)
+    )
+knowledge_vectorstore = Qdrant(
+    client=qdrant,
+    collection_name=KNOWLEDGE_COLLECTION,
+    embeddings=embeddings
+)
+
 # ——————————————————————————————————————————————
-# 2. Original AI feedback function (unchanged)
+# 2. AI Feedback on Journal Entry
 # ——————————————————————————————————————————————
 def get_ai_feedback(journal_text: str) -> str:
     system_prompt = """
@@ -77,7 +87,7 @@ Respond in this JSON format:
     return response.choices[0].message.content or "No response generated."
 
 # ——————————————————————————————————————————————
-# 3. Store journal entry function (unchanged)
+# 3. Store Journal Entry
 # ——————————————————————————————————————————————
 def store_journal_entry(user_id: str, journal_text: str) -> str:
     point_id = str(uuid.uuid4())
@@ -89,14 +99,9 @@ def store_journal_entry(user_id: str, journal_text: str) -> str:
     return point_id
 
 # ——————————————————————————————————————————————
-# 4. NEW: Retrieve relevant journal entries for a user
+# 4. Retrieve Relevant Journal Entries
 # ——————————————————————————————————————————————
 def get_relevant_entries(user_id: str, query: str, limit: int = 10) -> list:
-    """
-    Search for journal entries related to the user's question.
-    Returns the most relevant entries based on semantic similarity.
-    """
-    # First, get all entries for this user
     all_user_entries = qdrant.scroll(
         collection_name=COLLECTION_NAME,
         scroll_filter=Filter(
@@ -105,13 +110,12 @@ def get_relevant_entries(user_id: str, query: str, limit: int = 10) -> list:
                 FieldCondition(key="metadata.type", match=MatchValue(value="journal"))
             ]
         ),
-        limit=100  # Adjust based on how many entries you expect
-    )[0]  # scroll returns (points, next_page_offset)
+        limit=100
+    )[0]
     
     if not all_user_entries:
         return []
     
-    # If we have entries, do a semantic search
     try:
         results = vectorstore.similarity_search(
             query=query,
@@ -121,7 +125,6 @@ def get_relevant_entries(user_id: str, query: str, limit: int = 10) -> list:
         return [doc.page_content for doc in results]
     except Exception as e:
         print(f"Search error: {e}")
-        # Fallback: return recent entries
         recent_entries = sorted(
             [e for e in all_user_entries if e.payload and isinstance(e.payload, dict)],
             key=lambda x: x.payload.get('metadata', {}).get('timestamp', 0) if x.payload and isinstance(x.payload, dict) else 0,
@@ -134,42 +137,39 @@ def get_relevant_entries(user_id: str, query: str, limit: int = 10) -> list:
         ]
 
 # ——————————————————————————————————————————————
-# 5. NEW: Personality Analysis Chatbot
+# 5. Personality Analysis + Expert Knowledge
 # ——————————————————————————————————————————————
 def analyze_personality_and_respond(user_id: str, user_question: str) -> str:
-    """
-    Analyze user's personality based on their journal entries and answer their question.
-    """
-    # Get relevant journal entries
     relevant_entries = get_relevant_entries(user_id, user_question, limit=8)
-    
     if not relevant_entries:
         return "I don't have enough journal entries from you yet to provide personalized insights. Please write a few more journal entries first!"
     
-    # Create context from journal entries
     journal_context = "\n\n---\n\n".join(relevant_entries)
-    
+
+    # 🔥 NEW: Retrieve expert knowledge relevant to the user's question
+    try:
+        expert_docs = knowledge_vectorstore.similarity_search(query=user_question, k=3)
+        expert_context = "\n\n---\n\n".join([doc.page_content for doc in expert_docs])
+    except Exception as e:
+        expert_context = "No expert knowledge retrieved."
+        print(f"Knowledge retrieval error: {e}")
+
     system_prompt = f"""
 You are an AI psychologist and behavioral analyst with expertise in personality psychology, CBT, and emotional intelligence.
 
-You have access to the user's journal entries below. Based on these entries, you can understand their:
-- Personality patterns and traits
-- Emotional responses and triggers
-- Behavioral patterns
-- Coping mechanisms
-- Growth areas and strengths
-- Recurring themes in their life
+Here is expert knowledge that may help answer the user's question:
+{expert_context}
 
-JOURNAL ENTRIES:
+Here are the user's journal entries:
 {journal_context}
 
-Now the user is asking you a question about themselves. Your task:
-1. Analyze their personality and behavioral patterns from the journal entries
-2. Identify relevant patterns that relate to their question
-3. Provide personalized insights and suggestions
-4. Be compassionate, specific, and actionable
+Now the user is asking you:
+"{user_question}"
 
-Answer their question based on what you observe in their writing patterns and experiences.
+Your task:
+1. Analyze their patterns and personality
+2. Use relevant expert knowledge to help
+3. Give actionable and compassionate advice
 """
 
     response = client.chat.completions.create(
@@ -183,17 +183,12 @@ Answer their question based on what you observe in their writing patterns and ex
     )
 
     content = response.choices[0].message.content
-    if content is None:
-        return "Sorry, I couldn't generate a response at this time."
-    return content
+    return content or "Sorry, I couldn't generate a response at this time."
 
 # ——————————————————————————————————————————————
-# 6. NEW: Interactive Chat Mode
+# 6. Interactive Chat Mode
 # ——————————————————————————————————————————————
 def start_personality_chat(user_id: str):
-    """
-    Start an interactive chat session where user can ask about their behavior/personality.
-    """
     print("\n🧠 Welcome to your Personal Behavior Analysis Chat!")
     print("Ask me anything about your personality, behavior patterns, or emotional tendencies.")
     print("I'll analyze your journal entries to give you personalized insights.")
@@ -201,16 +196,12 @@ def start_personality_chat(user_id: str):
     
     while True:
         user_question = input("You: ").strip()
-        
         if user_question.lower() in ['quit', 'exit', 'bye']:
             print("🤖 Take care! Keep journaling for better insights!")
             break
-            
         if not user_question:
             continue
-            
         print("\n🤖 Analyzing your patterns...")
-        
         try:
             ai_response = analyze_personality_and_respond(user_id, user_question)
             print(f"\nAI Analyst: {ai_response}\n")
@@ -219,12 +210,9 @@ def start_personality_chat(user_id: str):
             print("Please try asking your question differently.\n")
 
 # ——————————————————————————————————————————————
-# 7. Enhanced Main Menu
+# 7. Main Menu
 # ——————————————————————————————————————————————
 def main_menu():
-    """
-    Main application menu with options for journaling and chatbot.
-    """
     user_id = os.getenv("USER_ID", "anonymous")
     
     while True:
@@ -239,7 +227,6 @@ def main_menu():
         choice = input("Choose an option (1-3): ").strip()
         
         if choice == "1":
-            # Original journaling functionality
             print("\n📝 Enter your journal entry (press ENTER twice to submit):\n")
             lines = []
             while True:
@@ -247,36 +234,26 @@ def main_menu():
                 if not line:
                     break
                 lines.append(line)
-            
             if not lines:
                 print("No entry provided.")
                 continue
-                
             journal_input = "\n".join(lines)
-            
-            # Get AI feedback
             print("\n🤖 GPT Feedback:\n")
             ai_reply = get_ai_feedback(journal_input)
             print(ai_reply)
-            
-            # Store journal entry
             print("\n📦 Storing your journal entry...")
             journal_point_id = store_journal_entry(user_id, journal_input)
             print(f"✅ Stored journal with ID: {journal_point_id}")
-            
         elif choice == "2":
-            # New personality chat functionality
             start_personality_chat(user_id)
-            
         elif choice == "3":
             print("👋 Goodbye! Keep reflecting and growing!")
             break
-            
         else:
             print("❌ Invalid choice. Please select 1, 2, or 3.")
 
 # ——————————————————————————————————————————————
-# 8. Run the application
+# 8. Run App
 # ——————————————————————————————————————————————
 if __name__ == "__main__":
     main_menu()
